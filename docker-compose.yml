@@ -1,0 +1,138 @@
+name: job-scheduler
+
+x-app: &app
+  build:
+    context: .
+  environment: &app-env
+    DATABASE_URL: postgres://scheduler:scheduler@postgres:5432/scheduler
+    REDIS_URL: redis://redis:6379
+    LOG_LEVEL: info
+    LEASE_DURATION_SECONDS: "30"
+    CLAIM_BATCH_SIZE: "32"
+    CLAIM_POLL_INTERVAL_MS: "50"
+    AGING_INTERVAL_SECONDS: "30"
+    FAIR_SHARE_ENABLED: "true"
+    FAIR_SHARE_MAX_PCT: "0.5"
+    BACKOFF_BASE_MS: "250"
+    BACKOFF_CAP_MS: "60000"
+    BREAKER_ENABLED: "true"
+    WORKER_HEARTBEAT_INTERVAL_MS: "5000"
+    WORKER_MISSED_BEATS: "3"
+    LEADER_POLL_INTERVAL_MS: "500"
+    REAPER_INTERVAL_MS: "1000"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+  # SIGKILL after 30s is deliberate: the graceful path gets a real window, and
+  # anything still holding a job past it is covered by lease expiry anyway.
+  stop_grace_period: 30s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: scheduler
+      POSTGRES_DB: scheduler
+    command:
+      # A queue is a write-heavy workload with a small hot set; these are the
+      # settings that matter for claim throughput on a laptop-sized instance.
+      - postgres
+      - -c
+      - max_connections=300
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - synchronous_commit=off
+      - -c
+      - work_mem=16MB
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler -d scheduler"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  api:
+    <<: *app
+    command: ["node", "dist/bin/api.js"]
+    environment:
+      <<: *app-env
+      HTTP_PORT: "3000"
+    ports:
+      - "3000:3000"
+
+  # Three schedulers. All of them dispatch work and serve reads; exactly one
+  # holds the advisory lock and runs the reaper, breakers and cron.
+  scheduler:
+    <<: *app
+    command: ["node", "dist/bin/scheduler.js"]
+    environment:
+      <<: *app-env
+      HTTP_PORT: "3001"
+    ports:
+      - "3001-3003:3001"
+    deploy:
+      replicas: 3
+
+  worker:
+    <<: *app
+    command: ["node", "dist/bin/worker.js"]
+    environment:
+      <<: *app-env
+      SCHEDULER_WS_URL: ws://scheduler:3001/worker
+      WORKER_CONCURRENCY: "8"
+      WORKER_QUEUES: default
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      scheduler:
+        condition: service_started
+    deploy:
+      replicas: 5
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3010:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  pgdata:

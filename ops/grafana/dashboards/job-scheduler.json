@@ -1,0 +1,278 @@
+{
+  "uid": "job-scheduler",
+  "title": "Job Scheduler",
+  "tags": ["queue", "scheduler"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "queue",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(queue_depth, queue)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Service level objectives",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Scheduling latency (enqueue → pickup)",
+      "description": "The headline SLO: p99 under 30ms. This is dispatch latency, so it only means anything while the fleet is below saturation - a backlog shows up here as queueing delay.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 8 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 30 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(job_scheduling_latency_ms_bucket[1m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(job_scheduling_latency_ms_bucket[1m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(job_scheduling_latency_ms_bucket[1m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Event loop lag",
+      "description": "Must stay under 50ms p99. Sampled in libuv, reset on every scrape, so each point is the worst delay in that scrape window.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 8 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 50 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        { "expr": "event_loop_lag_ms{quantile=\"0.99\"}", "legendFormat": "{{instance}} p99" },
+        { "expr": "event_loop_lag_ms{quantile=\"0.5\"}", "legendFormat": "{{instance}} p50" }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Throughput",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Jobs per second",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 10 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "sum(rate(jobs_enqueued_total[1m]))", "legendFormat": "enqueued" },
+        { "expr": "sum(rate(jobs_claimed_total[1m]))", "legendFormat": "claimed" },
+        {
+          "expr": "sum(rate(jobs_completed_total{state=\"SUCCEEDED\"}[1m]))",
+          "legendFormat": "succeeded"
+        },
+        {
+          "expr": "sum(rate(jobs_completed_total{state=\"DEAD\"}[1m]))",
+          "legendFormat": "dead"
+        },
+        { "expr": "sum(rate(jobs_retried_total[1m]))", "legendFormat": "retried" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue depth by state",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 10 },
+      "fieldConfig": {
+        "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } } }
+      },
+      "targets": [
+        {
+          "expr": "sum(queue_depth{queue=~\"$queue\"}) by (state)",
+          "legendFormat": "{{state}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue depth by tenant (fair share)",
+      "description": "Under contention no tenant should exceed its weighted slice of worker capacity.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
+      "targets": [
+        {
+          "expr": "sum(queue_depth{state=\"PENDING\", queue=~\"$queue\"}) by (tenant)",
+          "legendFormat": "{{tenant}} pending"
+        },
+        {
+          "expr": "sum(queue_depth{state=~\"CLAIMED|RUNNING\", queue=~\"$queue\"}) by (tenant)",
+          "legendFormat": "{{tenant}} in flight"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Claim transaction duration",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "ms" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(claim_transaction_duration_ms_bucket[1m])) by (le))",
+          "legendFormat": "p99"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(claim_transaction_duration_ms_bucket[1m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(claim_batch_size_bucket[1m])) by (le))",
+          "legendFormat": "median batch size"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Reliability",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Reclaims by path",
+      "description": "socket_close and heartbeat_loss are the immediate path; lease_expiry is the backstop. A rise in lease_expiry relative to the others means schedulers are dying, not workers.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 27 },
+      "targets": [
+        {
+          "expr": "sum(rate(jobs_reclaimed_total[1m])) by (path, outcome)",
+          "legendFormat": "{{path}} / {{outcome}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Workers and leadership",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 27 },
+      "targets": [
+        { "expr": "sum(workers_by_state) by (state)", "legendFormat": "workers {{state}}" },
+        { "expr": "sum(scheduler_is_leader)", "legendFormat": "leaders (must be 1)" },
+        {
+          "expr": "sum(rate(scheduler_leader_transitions_total[5m])) by (direction)",
+          "legendFormat": "transitions {{direction}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Leaders",
+      "description": "Anything other than 1 is a split brain or an outage.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "sum(scheduler_is_leader)", "legendFormat": "leaders" }]
+    },
+    {
+      "type": "stat",
+      "title": "Dead letter queue",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "sum(queue_depth{state=\"DEAD\"})", "legendFormat": "dead" }]
+    },
+    {
+      "type": "stat",
+      "title": "Open circuit breakers",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "targets": [{ "expr": "sum(circuit_breaker_open)", "legendFormat": "open" }]
+    },
+    {
+      "type": "stat",
+      "title": "Dashboard frames dropped",
+      "description": "Backpressure working as designed: slow viewers lose frames, the scheduler does not lose memory.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 35 },
+      "targets": [
+        { "expr": "sum(rate(dashboard_frames_dropped_total[5m]))", "legendFormat": "dropped/s" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Postgres pool pressure",
+      "description": "db_pool_waiting above zero means requests are queueing for a connection - the first thing to check when latency rises.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 40 },
+      "targets": [
+        { "expr": "sum(db_pool_waiting) by (instance)", "legendFormat": "{{instance}} waiting" },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(db_query_duration_seconds_bucket[1m])) by (le, label))",
+          "legendFormat": "p99 {{label}}"
+        }
+      ]
+    }
+  ]
+}

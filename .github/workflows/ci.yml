@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  static:
+    name: typecheck + lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Lint
+        run: npm run lint
+
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run test:unit
+
+  integration:
+    name: integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: scheduler
+          POSTGRES_PASSWORD: scheduler
+          POSTGRES_DB: scheduler_test
+        ports: ['5433:5432']
+        options: >-
+          --health-cmd "pg_isready -U scheduler -d scheduler_test"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports: ['6380:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      DATABASE_URL: postgres://scheduler:scheduler@localhost:5433/scheduler_test
+      REDIS_URL: redis://localhost:6380
+      LOG_LEVEL: error
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      # The failure tests spawn dist/ entrypoints as real processes to SIGKILL,
+      # so the build has to exist before they run.
+      - name: Build
+        run: npm run build
+      - name: Integration tests
+        run: npm run test:integration
+
+  chaos:
+    name: chaos smoke (10k jobs)
+    runs-on: ubuntu-latest
+    # The full 100k run takes too long for every PR; this is the same harness at
+    # a size that still kills processes mid-flight and still asserts zero loss.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: scheduler
+          POSTGRES_PASSWORD: scheduler
+          POSTGRES_DB: scheduler_test
+        ports: ['5433:5432']
+        options: >-
+          --health-cmd "pg_isready -U scheduler -d scheduler_test"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports: ['6380:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      DATABASE_URL: postgres://scheduler:scheduler@localhost:5433/scheduler_test
+      REDIS_URL: redis://localhost:6380
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Chaos run
+        run: npx tsx src/chaos/chaos.ts --jobs=10000 --workers=4 --schedulers=3 --kill-every=3000 --timeout=420000
+
+  docker:
+    name: docker compose builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build images
+        run: docker compose build
+      - name: Boot the stack and check health
+        run: |
+          docker compose up -d
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:3000/health; then exit 0; fi
+            sleep 2
+          done
+          docker compose logs --tail=100
+          exit 1
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

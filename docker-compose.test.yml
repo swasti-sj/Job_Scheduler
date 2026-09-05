@@ -1,0 +1,31 @@
+# Dependencies only. Integration tests and the chaos harness run on the host
+# against these, so a failing test can be debugged with a normal debugger
+# instead of through a container boundary.
+name: job-scheduler-test
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: scheduler
+      POSTGRES_DB: scheduler_test
+    command: [postgres, -c, max_connections=300, -c, fsync=off, -c, synchronous_commit=off, -c, full_page_writes=off]
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler -d scheduler_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
