@@ -187,10 +187,19 @@ export const eventLoopLag = new Gauge({
  * the JS side - unlike a setInterval-drift probe, which itself competes for the
  * loop it is trying to measure. Percentiles are read and the histogram reset on
  * every Prometheus scrape, so each scrape reports the window since the last one.
+ *
+ * Caveat worth knowing when reading the numbers: the sampler cannot resolve a
+ * delay finer than its own resolution, and on hosts with a coarse timer (Windows
+ * schedules at ~15.6ms; virtualised clocks are often worse) there is a constant
+ * offset on top of that which is the platform, not the process. A p50 and p99
+ * that sit almost on top of each other at roughly the resolution value means the
+ * loop is idle and you are reading the floor, not real lag.
  */
 let loopHistogram: IntervalHistogram | null = null;
 
-export function startEventLoopMonitor(resolutionMs = 10): void {
+export function startEventLoopMonitor(
+  resolutionMs = Number.parseInt(process.env['EVENT_LOOP_RESOLUTION_MS'] ?? '5', 10),
+): void {
   if (loopHistogram !== null) return;
   loopHistogram = monitorEventLoopDelay({ resolution: resolutionMs });
   loopHistogram.enable();

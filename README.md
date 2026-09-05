@@ -453,15 +453,15 @@ gap is worth being precise about.**
 
 | Metric | Target | Measured | |
 |---|---|---|---|
-| Scheduling latency p50 | — | **11 ms** | ✅ |
-| Scheduling latency p99 | < 30 ms | **59 ms** | ❌ |
-| Enqueue, bulk | 10 000/s | **19 000–32 000/s** | ✅ |
-| Enqueue, one HTTP request per job | 10 000/s | **362/s** | ❌ |
-| Processed | 5 000/s | **484/s** | ❌ |
+| Scheduling latency p50 | — | **14.8 ms** | ✅ |
+| Scheduling latency p99 | < 30 ms | **78 ms** | ❌ |
+| Enqueue, bulk | 10 000/s | **10 300/s** (peaks to 32 000/s) | ✅ |
+| Enqueue, one HTTP request per job | 10 000/s | **521/s** | ❌ |
+| Processed | 5 000/s | **580/s** | ❌ |
 | Worker failure detection | < 15 s | **< 1 s** (socket close) | ✅ |
 | Leader failover | < 2 s | **~330 ms** | ✅ |
 | Zero job loss under chaos | required | **verified** | ✅ |
-| Event loop lag p99 | < 50 ms | **~69 ms** (≈15 ms is measurement floor) | ❌ |
+| Event loop lag p99 | < 50 ms | **20.7 ms** typical, 46.7 ms worst window | ✅ |
 
 ### Why the throughput numbers are low, honestly
 
@@ -480,9 +480,12 @@ queue is round-trip bound, not CPU bound, essentially every throughput figure he
 measurement of the Docker network stack. Redis over the same hop is 40× faster than
 Postgres because it is one round trip instead of several.
 
-The event loop lag has a similar story: **p50 sits at ~15 ms even at idle**, which is
-Windows' 15.6 ms timer granularity showing up in `monitorEventLoopDelay`, not work in
-our process. GC accounted for 0.18 s across an entire run. On Linux that floor is ~1 ms.
+The event loop lag has a similar story. `monitorEventLoopDelay` cannot resolve a delay
+finer than its own sampling resolution, and on top of that the host clock adds a constant
+offset: **~15 ms on this Windows host** (its scheduler ticks at 15.6 ms) and ~10 ms inside
+the WSL2 containers. The tell is that p50 and p99 sit almost on top of each other while
+idle — real lag has a spread, a floor does not. GC accounted for 0.18 s across an entire
+run, so the excursions above the floor are genuinely small.
 
 I could have reported the bulk-enqueue number alone (32 000/s, comfortably over target)
 and left it there. That would have been misleading.
@@ -494,13 +497,19 @@ makes every unnecessary one obvious:
 
 | Change | Effect |
 |---|---|
-| Enqueue: 5 round trips → **1** (tenant upsert + insert + dedup select + audit in one data-modifying CTE) | 158 → 362 req/s |
-| Completion: 4 round trips → **1** (update + dependent unblock + 2 audit inserts in one statement) | contributed to 292 → 484 jobs/s |
+| Enqueue: 5 round trips → **1** (tenant upsert + insert + dedup select + audit in one data-modifying CTE) | 158 → 521 req/s |
+| Completion: 4 round trips → **1** (update + dependent unblock + 2 audit inserts in one statement) | 292 → 580 jobs/s |
 | Dispatcher claims for different workers **concurrently** instead of serially | dispatch latency became max-of-workers, not sum-of-workers |
-| Adaptive poll backoff — idle polling doubles to a 500 ms ceiling, resets on any signal | removed ~50 wasted claim queries/sec/worker at idle |
+| Adaptive poll backoff — idle polling doubles to a 500 ms ceiling, resets on any signal | removed ~50 wasted claim queries/sec/worker at idle; **event loop lag p99 296 ms → 47 ms** |
 
-All four are correct improvements independent of the environment; the slow network just
-made them measurable.
+Net: **3.3× enqueue, 2× throughput, 6× less event loop lag.** All four are correct
+improvements independent of the environment; the slow network just made them visible.
+
+The adaptive backoff came with a lesson of its own. It initially made p99 latency
+*worse* (59 → 99 ms) — because the load harness inserted rows with raw SQL and so never
+published the `work_available` wakeup that a real `POST /jobs` sends, leaving dispatch to
+wait on a poll interval that had just backed off. The harness was measuring its own
+shortcut. Fixed by having it publish the notification like a real client.
 
 ### Methodology note
 
@@ -532,23 +541,32 @@ At the end it asserts, against the **audit log**:
 - the job count is unchanged
 
 ```
-$ npm run chaos -- --jobs=2000 --workers=3 --schedulers=2 --kill-every=3000
+$ npm run chaos -- --jobs=10000 --workers=5 --schedulers=3 --kill-every=4000
 
-  SIGKILL worker-0
-  806/2000 terminal  (pending 1181, in-flight 13, 159/s)
+enqueued in 0.3s (31447/s)
   SIGKILL sched-1
+  SIGKILL sched-1
+  SIGKILL worker-1
+  SIGKILL sched-2
+  SIGKILL worker-1
   SIGKILL worker-2
-  1815/2000 terminal (pending 166, in-flight 19, 199/s)
+  SIGKILL worker-1
 
 --- verification ---
-jobs submitted        : 2000
-terminal              : 2000 (succeeded 2000, dead 0, cancelled 0)
+jobs submitted        : 10000
+jobs in table         : 10000
+terminal              : 10000 (succeeded 10000, dead 0, cancelled 0)
+not terminal          : 0
 duplicate terminals   : 0
 orphaned in-flight    : 0
-SIGKILLs              : 1 schedulers, 4 workers
+SIGKILLs              : 3 schedulers, 4 workers
+wall time             : 30.0s (334 jobs/s)
 
 RESULT: PASS - zero job loss, zero duplicate execution
 ```
+
+Note that **not one job even reached the dead-letter queue**: every job interrupted by a
+SIGKILL was reclaimed and retried successfully, well inside its attempt budget.
 
 CI runs a 10 000-job variant on every PR; the 100 000-job run takes too long for a
 pull request but uses the identical harness.
